@@ -1,0 +1,60 @@
+# Managed fork sync: preserve local commits; never force-push or reset.
+# Schedule: every day at 09:17 China Standard Time (UTC+8).
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: ${{ github.event.repository.fork == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_HOST: github.com
+      GH_PROMPT_DISABLED: "1"
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      # No checkout: do not execute upstream code or install dependencies.
+      - name: Merge upstream into the fork default branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$(gh api "repos/$REPOSITORY")"
+          if ! jq -e ".fork == true and .parent != null" <<< "$metadata" >/dev/null; then
+            echo "::error::The repository has no accessible upstream fork relationship."
+            exit 1
+          fi
+          branch="$(jq -er ".default_branch" <<< "$metadata")"
+          upstream="$(jq -er ".parent.full_name" <<< "$metadata")"
+          upstream_branch="$(jq -er ".parent.default_branch" <<< "$metadata")"
+          {
+            echo "## Upstream synchronization"
+            printf "Fork: %s (%s)\n\n" "$REPOSITORY" "$branch"
+            printf "Upstream: %s (%s)\n\n" "$upstream" "$upstream_branch"
+            echo "Policy: merge only; preserve fork commits; stop on conflicts or permission errors."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$branch" != "$upstream_branch" ]]; then
+            echo "::error::Default branch names differ; review branch mapping before syncing."
+            echo "Result: blocked by different default branch names." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if result="$(gh api --method POST "repos/$REPOSITORY/merge-upstream" -f "branch=$branch" 2>&1)"; then
+            printf "%s\n" "$result"
+            printf "\nResult: %s\n" "$result" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf "%s\n" "$result" >&2
+            echo "::error::Upstream sync failed. Resolve merge conflicts, branch protection, or workflow-file permissions manually; no force-sync was attempted."
+            echo "Result: failed; inspect logs. No reset or force-sync was attempted." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
